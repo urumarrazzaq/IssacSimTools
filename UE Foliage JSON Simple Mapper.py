@@ -11,7 +11,7 @@ import omni.kit.commands
 from pxr import UsdGeom, Gf
 
 
-WINDOW_TITLE = "UE Foliage JSON Simple Mapper"
+WINDOW_TITLE = "UE Foliage JSON Simple Mapper + Ground Snap"
 window_ref = None
 
 MESH_NAME_TO_ISAAC_PATH = {}
@@ -43,7 +43,11 @@ def ensure_xform(stage, path):
 
 
 def duplicate_prim(source_path, target_path):
-    omni.kit.commands.execute("CopyPrim", path_from=source_path, path_to=target_path)
+    omni.kit.commands.execute(
+        "CopyPrim",
+        path_from=source_path,
+        path_to=target_path
+    )
 
 
 def extract_mesh_name(ue_mesh_path):
@@ -55,9 +59,54 @@ def sanitize_name(name):
     return re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
 
-def apply_transform(target_path, item, unit_scale, asset_scale, flip_y, yaw_offset):
+def set_translate_op(prim, x, y, z):
+    xf = UsdGeom.Xformable(prim)
+    for op in xf.GetOrderedXformOps():
+        if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+            op.Set(Gf.Vec3d(x, y, z))
+            return True
+    xf.AddTranslateOp().Set(Gf.Vec3d(x, y, z))
+    return True
+
+
+def raycast_ground_z(x, y, z, start_height, end_depth):
+    try:
+        import omni.physx
+
+        query = omni.physx.get_physx_scene_query_interface()
+
+        origin = Gf.Vec3f(x, y, z + start_height)
+        direction = Gf.Vec3f(0.0, 0.0, -1.0)
+        distance = start_height + end_depth
+
+        hit = query.raycast_closest(origin, direction, distance)
+
+        if hit and hit.get("hit", False):
+            pos = hit.get("position")
+            if pos:
+                return float(pos[2])
+
+    except Exception as e:
+        print(f"Ground snap raycast failed: {e}")
+
+    return None
+
+
+def apply_transform(
+    target_path,
+    item,
+    unit_scale,
+    asset_scale,
+    flip_y,
+    yaw_offset,
+    snap_to_ground,
+    ray_start_height,
+    ray_end_depth,
+    ground_offset
+):
     stage = get_stage()
     prim = stage.GetPrimAtPath(target_path)
+
     if not prim or not prim.IsValid():
         return False
 
@@ -78,6 +127,11 @@ def apply_transform(target_path, item, unit_scale, asset_scale, flip_y, yaw_offs
         yaw *= -1.0
         roll *= -1.0
 
+    if snap_to_ground:
+        ground_z = raycast_ground_z(x, y, z, ray_start_height, ray_end_depth)
+        if ground_z is not None:
+            z = ground_z + ground_offset
+
     sx = scl["x"] * asset_scale
     sy = scl["y"] * asset_scale
     sz = scl["z"] * asset_scale
@@ -85,6 +139,7 @@ def apply_transform(target_path, item, unit_scale, asset_scale, flip_y, yaw_offs
     xf = UsdGeom.Xformable(prim)
     xf.ClearXformOpOrder()
     xf.SetResetXformStack(True)
+
     xf.AddTranslateOp().Set(Gf.Vec3d(x, y, z))
     xf.AddRotateXYZOp().Set(Gf.Vec3f(roll, pitch, yaw))
     xf.AddScaleOp().Set(Gf.Vec3f(sx, sy, sz))
@@ -94,15 +149,22 @@ def apply_transform(target_path, item, unit_scale, asset_scale, flip_y, yaw_offs
 
 class FoliageWindow:
     def __init__(self):
-        self.window = ui.Window(WINDOW_TITLE, width=760, height=720)
+        self.window = ui.Window(WINDOW_TITLE, width=780, height=760)
 
         self.json_path_model = ui.SimpleStringModel(r"C:/Temp/foliage_export.json")
         self.output_root_model = ui.SimpleStringModel("/World/UE_Foliage_Meshes")
 
         self.unit_scale_model = ui.SimpleFloatModel(0.01)
         self.asset_scale_model = ui.SimpleFloatModel(0.01)
+
         self.flip_y_model = ui.SimpleBoolModel(False)
         self.yaw_offset_model = ui.SimpleFloatModel(0.0)
+
+        self.snap_ground_model = ui.SimpleBoolModel(True)
+        self.ray_start_height_model = ui.SimpleFloatModel(50.0)
+        self.ray_end_depth_model = ui.SimpleFloatModel(300.0)
+        self.ground_offset_model = ui.SimpleFloatModel(0.0)
+
         self.batch_size_model = ui.SimpleIntModel(25)
         self.preview_count_model = ui.SimpleIntModel(0)
 
@@ -119,25 +181,31 @@ class FoliageWindow:
     def set_status(self, text, progress=None):
         if self.status_label:
             self.status_label.text = text
+
         if self.progress_bar and progress is not None:
             self.progress_bar.model.set_value(max(0.0, min(1.0, float(progress))))
+
         print(text)
 
     def load_json(self):
         path = self.json_path_model.as_string.replace("\\", "/")
+
         if not os.path.exists(path):
             raise Exception(f"JSON file not found: {path}")
+
         with open(path, "r") as f:
             data = json.load(f)
+
         if not data:
             raise Exception("JSON is empty.")
+
         return data
 
     def build_ui(self):
         with self.window.frame:
             with ui.ScrollingFrame():
                 with ui.VStack(spacing=8):
-                    ui.Label("UE JSON Foliage → Isaac Simple Manual Mapper", height=28)
+                    ui.Label("UE JSON Foliage → Isaac Manual Mapper + Ground Snap", height=30)
 
                     ui.Label("JSON Path")
                     ui.StringField(model=self.json_path_model)
@@ -151,40 +219,66 @@ class FoliageWindow:
                         ui.Button("Cancel", clicked_fn=self.cancel_spawn)
                         ui.Button("Clear Mappings", clicked_fn=self.clear_mappings)
 
+                    ui.Separator()
+                    ui.Label("Transform Settings")
+
                     with ui.HStack(height=30):
-                        ui.Label("Unit Scale", width=180)
+                        ui.Label("Unit Scale", width=210)
                         ui.FloatField(model=self.unit_scale_model)
 
                     with ui.HStack(height=30):
-                        ui.Label("Asset Scale Fix", width=180)
+                        ui.Label("Asset Scale Fix", width=210)
                         ui.FloatField(model=self.asset_scale_model)
 
                     with ui.HStack(height=30):
-                        ui.Label("Flip Y Axis", width=180)
+                        ui.Label("Flip Y Axis", width=210)
                         ui.CheckBox(model=self.flip_y_model)
 
                     with ui.HStack(height=30):
-                        ui.Label("Yaw Offset", width=180)
+                        ui.Label("Yaw Offset", width=210)
                         ui.FloatField(model=self.yaw_offset_model)
 
+                    ui.Separator()
+                    ui.Label("Ground Snap Settings")
+
                     with ui.HStack(height=30):
-                        ui.Label("Batch Size", width=180)
+                        ui.Label("Snap To Ground", width=210)
+                        ui.CheckBox(model=self.snap_ground_model)
+
+                    with ui.HStack(height=30):
+                        ui.Label("Ray Start Height", width=210)
+                        ui.FloatField(model=self.ray_start_height_model)
+
+                    with ui.HStack(height=30):
+                        ui.Label("Ray End Depth", width=210)
+                        ui.FloatField(model=self.ray_end_depth_model)
+
+                    with ui.HStack(height=30):
+                        ui.Label("Ground Offset", width=210)
+                        ui.FloatField(model=self.ground_offset_model)
+
+                    ui.Separator()
+                    ui.Label("Spawn Settings")
+
+                    with ui.HStack(height=30):
+                        ui.Label("Batch Size", width=210)
                         ui.IntField(model=self.batch_size_model)
 
                     with ui.HStack(height=30):
-                        ui.Label("Preview Count, 0 = All", width=180)
+                        ui.Label("Preview Count, 0 = All", width=210)
                         ui.IntField(model=self.preview_count_model)
 
                     ui.Separator()
-                    ui.Label("JSON Item Types — select an Isaac prim, then press Add Selected on the matching row")
+                    ui.Label("JSON Item Types — select an Isaac prim, then press Add Selected on matching row")
 
-                    self.list_frame = ui.Frame(height=360)
+                    self.list_frame = ui.Frame(height=380)
                     self.refresh_list()
 
                     ui.Separator()
                     ui.Label("Progress")
                     self.progress_bar = ui.ProgressBar(height=24)
                     self.progress_bar.model.set_value(0.0)
+
                     self.status_label = ui.Label("Idle", height=44)
 
     def refresh_list(self):
@@ -201,7 +295,7 @@ class FoliageWindow:
                     with ui.HStack(height=30):
                         ui.Label(f"{count}x", width=70)
                         ui.Label(mesh_name, width=260)
-                        ui.Label(status, width=260)
+                        ui.Label(status, width=280)
                         ui.Button(
                             "Add Selected",
                             width=120,
@@ -265,6 +359,7 @@ class FoliageWindow:
         if self.is_processing:
             self.set_status("Already spawning.")
             return
+
         asyncio.ensure_future(self.spawn_async())
 
     async def spawn_async(self):
@@ -280,12 +375,19 @@ class FoliageWindow:
                 data = data[:preview]
 
             total = len(data)
+
             output_root = self.output_root_model.as_string
 
             unit_scale = self.unit_scale_model.as_float
             asset_scale = self.asset_scale_model.as_float
             flip_y = self.flip_y_model.as_bool
             yaw_offset = self.yaw_offset_model.as_float
+
+            snap_to_ground = self.snap_ground_model.as_bool
+            ray_start_height = self.ray_start_height_model.as_float
+            ray_end_depth = self.ray_end_depth_model.as_float
+            ground_offset = self.ground_offset_model.as_float
+
             batch_size = max(1, self.batch_size_model.as_int)
 
             clear_path(stage, output_root)
@@ -294,6 +396,7 @@ class FoliageWindow:
             spawned = 0
             skipped = 0
             failed = 0
+            snapped = 0
             per_mesh = {}
 
             for i, item in enumerate(data):
@@ -322,10 +425,27 @@ class FoliageWindow:
 
                 try:
                     duplicate_prim(source_path, target_path)
-                    if apply_transform(target_path, item, unit_scale, asset_scale, flip_y, yaw_offset):
+
+                    before_z = item["location"]["z"] * unit_scale
+
+                    ok = apply_transform(
+                        target_path,
+                        item,
+                        unit_scale,
+                        asset_scale,
+                        flip_y,
+                        yaw_offset,
+                        snap_to_ground,
+                        ray_start_height,
+                        ray_end_depth,
+                        ground_offset
+                    )
+
+                    if ok:
                         spawned += 1
                     else:
                         failed += 1
+
                 except Exception as e:
                     failed += 1
                     print(f"Failed {mesh_name} at index {i}: {e}")
@@ -336,6 +456,16 @@ class FoliageWindow:
                         (i + 1) / total
                     )
                     await update_ui()
+
+            print("\n========== SPAWN SUMMARY ==========")
+            print(f"Total JSON items: {total}")
+            print(f"Spawned: {spawned}")
+            print(f"Skipped unmapped: {skipped}")
+            print(f"Failed: {failed}")
+            print("-----------------------------------")
+            for name, count in sorted(per_mesh.items(), key=lambda x: x[1], reverse=True):
+                print(f"{count}x | {name}")
+            print("===================================\n")
 
             self.set_status(
                 f"Done. Spawned: {spawned}, Skipped unmapped: {skipped}, Failed: {failed}",
